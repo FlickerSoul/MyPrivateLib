@@ -1,0 +1,149 @@
+name: "Release Private Binary"
+on:
+  push:
+    tags:
+      - '*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (format x.x.x). If omitted, the tag version will be used (for tag triggers).'
+        required: false
+        default: ''
+jobs:
+  build:
+    runs-on: macos-15
+    env:
+        RELEASE_REPO: "FlickerSoul/MyPrivateLibReleasePrivate"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Build XCFramework
+        run: |
+          chmod +x ./scripts/build-proj.sh
+          ./scripts/build-proj.sh
+      - name: Setup Signing
+        if: false # skipped
+        env:
+          BUILD_CERT_BASE64: ${{ secrets.BUILD_SIGNING_CERT }}
+          BUILD_CERT_PWD: ${{ secrets.BUILD_SIGNING_CERT_PWD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+          APPLE_TRUST_CERTIFICATE_PATH=$RUNNER_TEMP/apple_trust.cer
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+          echo -n "$BUILD_CERT_BASE64" | base64 --decode -o $CERTIFICATE_PATH
+
+          # temporary keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          # add apple's root certificate
+          curl -o $APPLE_TRUST_CERTIFICATE_PATH https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer
+          security import $APPLE_TRUST_CERTIFICATE_PATH -k $KEYCHAIN_PATH
+
+          # import certificate to keychain
+          security import $CERTIFICATE_PATH -P "$BUILD_CERT_PWD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH
+
+          # show identities
+          security find-identity -v $KEYCHAIN_PATH
+
+          # export keychain path
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> $GITHUB_ENV
+      - name: Sign XCFramework
+        if: false # skipped
+        run: |
+          codesign --timestamp --keychain "${KEYCHAIN_PATH}" -s "Apple Distribution" "${XCFRAMEWORK_PATH}"
+      - name: Upload XCFramework Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: XCFramework
+          path: ${{ env.XCFRAMEWORK_OUTPUT }}
+          if-no-files-found: error
+      - name: Zip XCFramework Output
+        run: |
+          echo "Zipping XCFramework directory..."
+          cd "${XCFRAMEWORK_OUTPUT}"
+          export XCFRAMEWORK_ZIP_OUTPUT="$(realpath "${XCFRAMEWORK_OUTPUT}/../")/XCFramework.zip"
+          zip -r "${XCFRAMEWORK_ZIP_OUTPUT}" ./*
+          echo "XCFRAMEWORK_ZIP_OUTPUT=${XCFRAMEWORK_ZIP_OUTPUT}" >> $GITHUB_ENV
+      - name: "Checksum"
+        id: checksum
+        run: |
+          export XCFRAMEWORK_ZIP_CHECKSUM="$(xcrun swift package compute-checksum "${XCFRAMEWORK_ZIP_OUTPUT}")"
+          echo "framework_checksum=${XCFRAMEWORK_ZIP_CHECKSUM}" >> $GITHUB_OUTPUT
+          echo "Checksum: $XCFRAMEWORK_ZIP_CHECKSUM"
+      - name: Determine Release Version
+        id: determine_version
+        run: |
+          # If a manual version is provided via workflow_dispatch, use it; otherwise, extract from tag.
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+            echo "Using manual version input: $VERSION"
+          else
+            TAG="${GITHUB_REF##*/}"
+            echo "Tag detected: $TAG"
+            if [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              VERSION="$TAG"
+            else
+              echo "Error: No valid version provided or tag does not match x.x.x format." >&2
+              exit 1
+            fi
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+      # Checkout the binary repository into a subdirectory so that subsequent git commands operate on it
+      - name: Checkout the release repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.RELEASE_REPO }}
+          token: ${{ secrets.BINARY_REPO_TOKEN }}
+          path: binary-repo
+      - name: Create draft release on the release repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.BINARY_REPO_TOKEN }}
+        run: |
+          gh release create "${{ steps.determine_version.outputs.version }}" "${{ env.XCFRAMEWORK_ZIP_OUTPUT }}" \
+            --repo "${{ env.RELEASE_REPO }}" \
+            --title "Release ${{ steps.determine_version.outputs.version }}" \
+            --notes "Release of version ${{ steps.determine_version.outputs.version }}. Checksum: \`${{ steps.checksum.outputs.framework_checksum }}\`." \
+            --draft
+      - name: Get asset URL from the draft release
+        id: get_asset_url
+        env:
+          GITHUB_TOKEN: ${{ secrets.BINARY_REPO_TOKEN }}
+        run: |
+          # Extract the URL of the first asset from the draft release (should start with "https://api.github.com")
+          ASSET_URL="$(gh release view "${{ steps.determine_version.outputs.version }}" --repo "${{ env.RELEASE_REPO }}"  --json assets | jq -r '.assets[0].apiUrl').zip"
+          echo "Asset URL: $ASSET_URL"
+          echo "asset_url=$ASSET_URL" >> $GITHUB_OUTPUT
+      - name: Update Package.swift with the asset URL and checksum
+        run: |
+          cd binary-repo
+          # Update the URL in the Package.swift to the asset URL from the draft release
+          sed -i.bak -E 's#(url: ")[^"]*(")#\1'"${{ steps.get_asset_url.outputs.asset_url }}"'\2#' Package.swift
+          # Update the checksum as provided
+          sed -i.bak -E 's#(checksum: ")[^"]*(")#\1${{ steps.checksum.outputs.framework_checksum }}\2#' Package.swift
+          rm Package.swift.bak
+      - name: Commit Package.swift update
+        run: |
+          cd binary-repo
+          git config user.email "app@universe.observer"
+          git config user.email "App"
+          git add Package.swift
+          git commit -m "Update Package.swift for release ${{ steps.determine_version.outputs.version }}"
+      - name: Create tag for the release and push branch and tag
+        run: |
+          cd binary-repo
+          git tag "${{ steps.determine_version.outputs.version }}"
+          git push --set-upstream origin main
+          git push origin main
+      - name: Update draft release to target latest commit
+        env:
+          GITHUB_TOKEN: ${{ secrets.BINARY_REPO_TOKEN }}
+        run: |
+          cd binary-repo
+          COMMIT_SHA=$(git rev-parse HEAD)
+          gh release edit "${{ steps.determine_version.outputs.version }}" --repo "${{ env.RELEASE_REPO }}" --target "$COMMIT_SHA"
