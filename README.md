@@ -20,12 +20,11 @@ MyPrivateLib/
 │   └── release-private.yaml     # CI: builds & publishes to FlickerSoul/MyPrivateLibReleasePrivate
 ├── Package.swift                # SPM manifest (used for local development/tests)
 ├── Project.swift                # Tuist project definition (used to generate the Xcode project for archiving)
-├── Tuist.swift                  # Tuist configuration
-└── VERSION                      # Single source of truth for the release version (e.g. 1.0.0)
+└── Tuist.swift                  # Tuist configuration
 ```
 
 ### Release flow
 
-1. Bump `VERSION` and push a `x.y.z` tag (or trigger the workflow manually).
+1. Trigger a release by pushing a new tag to the repository (via drafting a release on GitHub or pushing a tag locally).
 2. CI runs `scripts/archive_proj.py` — installs Tuist, generates the Xcode project, archives for iOS device and Simulator, and assembles an `.xcframework` zip.
 3. CI runs `scripts/upload_release.py` — creates a draft release on the binary distribution repo, updates `Package.swift` there with the new download URL and checksum, commits, tags, and pushes.
