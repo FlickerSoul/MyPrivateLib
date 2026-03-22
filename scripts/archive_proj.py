@@ -75,30 +75,31 @@ def main() -> None:
         "-skipMacroValidation",
     ]
 
-    print("Archiving for iOS Device...")
-    xcbeautify_piped_exit_on_failure([
-        "xcodebuild", "archive",
-        *common_args,
-        "-destination", "generic/platform=iOS",
-        "-archivePath", str(archive_path / "iOS.xcarchive"),
-    ])
+    destinations = [
+        ("iOS", "generic/platform=iOS"),
+        ("iOS-Simulator", "generic/platform=iOS Simulator"),
+    ]
 
-    print("Archiving for iOS Simulator...")
-    xcbeautify_piped_exit_on_failure([
-        "xcodebuild", "archive",
-        *common_args,
-        "-destination", "generic/platform=iOS Simulator",
-        "-archivePath", str(archive_path / "iOS-Simulator.xcarchive"),
-    ])
+    for archive_name, destination in destinations:
+        print(f"Archiving for {archive_name}...")
+        xcbeautify_piped_exit_on_failure([
+            "xcodebuild", "archive",
+            *common_args,
+            "-destination", destination,
+            "-archivePath", str(archive_path / f"{archive_name}.xcarchive"),
+        ])
 
     print("Creating XCFramework...")
     product_output.mkdir(parents=True, exist_ok=True)
+    xcframework_args = []
+    for archive_name, _ in destinations:
+        xcframework_args += [
+            "-archive", str(archive_path / f"{archive_name}.xcarchive"),
+            "-framework", f"{framework_name}.framework",
+        ]
     xcbeautify_piped_exit_on_failure([
         "xcodebuild", "-create-xcframework",
-        "-archive", str(archive_path / "iOS.xcarchive"),
-        "-framework", f"{framework_name}.framework",
-        "-archive", str(archive_path / "iOS-Simulator.xcarchive"),
-        "-framework", f"{framework_name}.framework",
+        *xcframework_args,
         "-output", str(xcframework_path),
     ])
 
